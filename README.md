@@ -59,24 +59,28 @@
 
 ### `search_listings`
 
-- **What it does:**
-- **Inputs:** <!-- name and type each: `max_price` (float), not "a price" -->
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Narrows the 40 mock listings in `data/listings.json` down to the ones matching a keyword description, and optionally a size and a price ceiling, ranked best match first.
+- **Inputs:** `description` (str, required) — free-text keywords, e.g. `"vintage graphic tee"`; `size` (str or None, default `None`) — one size token such as `"M"`, `"W30"`, `"US 9"`, where `None` skips size filtering entirely; `max_price` (float or None, default `None`) — inclusive dollar ceiling, where `None` skips price filtering entirely.
+- **Returns:** A `list[dict]` of at most `config.SEARCH_RESULT_LIMIT` (10) listing dicts, sorted by keyword-overlap score descending, ties broken by `price` ascending then `id` ascending so the order is identical on repeated runs. Each dict is a listing copied out of the data file unmodified, with all eleven fields: `id` (str), `title` (str), `description` (str), `category` (str — one of `tops`, `bottoms`, `outerwear`, `shoes`, `accessories`), `style_tags` (list[str]), `size` (str), `condition` (str — `excellent`, `good`, or `fair`), `price` (float), `colors` (list[str]), `brand` (str or `None` — **`None` for 32 of the 40 listings**), `platform` (str — `depop`, `poshmark`, or `thredUp`).
+- **When it has nothing:** `[]`. An empty list — never `None`, never an exception, never a "no results" string. This is the single value the planning loop branches on.
+
+**Size match rule** (part of the spec, because `"s" in "us 9"` and `"l" in "xl"` are both `True` and a plain substring test would return shoes to someone asking for a small top): uppercase both sides, split each on `/`, whitespace, and parentheses into tokens, and count it a match when **every** token of the requested size appears in the listing's token set. So `"M"` matches `"S/M"` and `"M/L"`; `"L"` matches `"L/XL"` but not `"XL"`; `"XL"` matches `"XL (oversized)"`; `"W30"` matches `"W30 L30"`; `"US 9"` and `"9"` both match `"US 9"`; and `"S"` does **not** match `"US 9"`. One exception, deliberate: any listing whose size contains `ONE SIZE` matches every request, because a one-size beanie does fit someone who asked for an M.
+
+**Scoring rule:** lowercase `description`, split on non-alphanumerics, drop the stopwords `a an the for in of my and to with looking want need size under`, and score each listing by how many distinct remaining query words appear anywhere in its searchable text — `title`, `description`, `style_tags`, `colors`, `category`, and `brand` when it isn't `None`. Anything scoring 0 is dropped.
 
 ### `suggest_outfit`
 
-- **What it does:**
-- **Inputs:**
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Asks the model, through `generate()`, for one or two outfits built around a thrifted item, naming pieces the user already owns whenever it can.
+- **Inputs:** `new_item` (dict, required) — one listing dict in the exact eleven-field shape `search_listings` returns; `wardrobe` (dict, required) — `{"items": list[dict]}`, where each item has `id` (str), `name` (str), `category` (str), `colors` (list[str]), `style_tags` (list[str]), `notes` (str or `None`). **`items` may be empty.**
+- **Returns:** A non-empty `str` of plain prose, no fixed format. With a non-empty wardrobe it names at least one wardrobe item by its `name` so the suggestion is checkably about clothes the user owns. With an empty wardrobe it returns general styling advice for the item on its own, and names no wardrobe pieces because there are none to name.
+- **When it has nothing:** There is no empty return. An empty wardrobe is a *different prompt*, not a failure — it still returns a non-empty string. The function never returns `""`, never returns `None`, and never raises on an empty wardrobe, so the loop does not branch here. (A model outage raises `ModelUnavailable`, which `run_agent` catches in unit 4; that is the transport failing, not this tool having nothing to say.)
 
 ### `create_fit_card`
 
-- **What it does:**
-- **Inputs:**
-- **Returns:**
-- **When it has nothing:**
+- **What it does:** Asks the model, through `generate()`, for a short caption someone would actually post about the find.
+- **Inputs:** `outfit` (str, required) — the string `suggest_outfit` returned; `new_item` (dict, required) — the same eleven-field listing dict.
+- **Returns:** A non-empty `str` of two to four sentences that reads like a post rather than a product description, mentioning the item, its `price`, and its `platform` once each. It must differ across different items, and across repeated runs on the same item — `TEMPERATURE = 0.9` and `CACHE_ENABLED` in `config.py` are the two reasons it might not.
+- **When it has nothing:** When `outfit` is `""` or whitespace only, return the literal string `"No outfit to write a card about — suggest_outfit returned nothing."` and make no model call. A descriptive string, not an exception, and not an empty string.
 
 ---
 
@@ -93,13 +97,13 @@
      The grader checks your code against what you claim here, so the file and
      function have to be real. -->
 
-**Branch rule:**
+**Branch rule:** If `search_listings` returns an empty list, write into `session["error"]` a message naming what the user could change — raise the price ceiling, drop or widen the size, use fewer keywords — and return the session immediately, leaving `selected_item`, `outfit_suggestion`, and `fit_card` all `None`. Otherwise take `search_results[0]` as `session["selected_item"]` and carry on to `suggest_outfit`, then `create_fit_card`.
 
 **Where it lives:** `agent.py::run_agent`
 
-**How the query is parsed:** <!-- regex, string splitting, or asking the model — say which -->
+**How the query is parsed:** regex plus string splitting — no model call, so parsing costs nothing and is identical on every run. Price: `(?:under|below|less than|max|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)`, falling back to a bare `\$\s*(\d+(?:\.\d{1,2})?)`, then `float()`. Size: `\bsize\s+([A-Za-z0-9/. ]{1,8}?)\b` first; only if that finds nothing, a bare-token pass for `\b(XS|S|M|L|XL|XXL|W\d{2}|US\s?\d(?:\.5)?)\b`. Description: the original query with the matched price and size spans cut out, then the same stopword list `search_listings` uses. Anything not found stays `None`, which means that filter is skipped rather than applied with a guess.
 
-**What moves through the session:** <!-- which fields, in what order -->
+**What moves through the session:** `query` (set by `new_session`) → `parsed` (`{"description": str, "size": str | None, "max_price": float | None}`) → `search_results` (`list[dict]`) → **branch**: either `error` (str) and stop, or `selected_item` (dict) → `outfit_suggestion` (str) → `fit_card` (str). `wardrobe` goes in at `new_session` and is only read, never written. Each step reads its input back out of the session rather than from a local variable, so a trace can print the whole state at any point.
 
 ---
 
